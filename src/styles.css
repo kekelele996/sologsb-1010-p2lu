@@ -200,6 +200,29 @@ md-linear-progress { width: 100%; --md-linear-progress-active-indicator-color: #
 .timeline-item strong { font-size: 12px; }
 .timeline-item p { margin: 3px 0; color: var(--muted); font-size: 10px; }
 
+.migration-summary { margin: 6px 0 0; color: var(--muted); font-size: 11px; line-height: 1.5; }
+.diff-chip { padding: 2px 8px; border-radius: 999px; font-size: 10px; font-weight: 600; }
+.diff-chip.added { background: #d8efe3; color: var(--success); }
+.diff-chip.changed { background: #fdf0d5; color: var(--warning); }
+.diff-chip.deprecated { background: #f6dcd9; color: var(--danger); }
+.diff-list { margin-top: 8px; display: flex; flex-direction: column; gap: 4px; }
+.diff-row { display: flex; align-items: center; gap: 8px; padding: 5px 8px; border-radius: 6px; background: var(--surface-container); font-size: 11px; }
+.diff-row.added { background: #eaf5ee; }
+.diff-row.changed { background: #fdf6e3; }
+.diff-row.deprecated { background: #fbeae8; }
+.diff-status { flex: 0 0 auto; font-size: 10px; font-weight: 700; color: var(--muted); }
+.diff-row.added .diff-status { color: var(--success); }
+.diff-row.changed .diff-status { color: var(--warning); }
+.diff-row.deprecated .diff-status { color: var(--danger); }
+.diff-output { margin-left: auto; color: var(--ink); font-family: "Apple Braille", monospace; }
+.diff-output s { color: var(--muted); }
+.batch-error { color: var(--danger) !important; }
+.batch-done .timeline-dot { background: var(--success); }
+.batch-failed .timeline-dot { background: var(--danger); }
+.batch-pending .timeline-dot { background: #b9c6c1; }
+.archived-badge { margin-left: 6px; padding: 1px 6px; border-radius: 999px; background: #f6dcd9; color: var(--danger); font-size: 9px; font-weight: 600; vertical-align: middle; }
+.rule-detail-card.archived { opacity: 0.7; }
+
 @media (max-width: 1320px) {
   .workspace-grid { grid-template-columns: 285px minmax(520px, 1fr) 330px; }
   .shortcut-hint { display: none; }

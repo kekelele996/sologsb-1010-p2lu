@@ -1,8 +1,17 @@
 import { useEffect, useMemo, useReducer, useRef, useState } from 'preact/hooks';
 import type { ComponentChildren } from 'preact';
 import { analyzeProject, brailleCellCount, makeRule, outputText, updateRuleInSet } from './braille';
-import { createInitialProject } from './sample';
-import type { HistoryState, ProofIssue, ProjectState, TextbookLine, VersionSnapshot } from './types';
+import {
+  NEW_STANDARD_PACKAGE,
+  confirmMigration,
+  diffRulesAgainstRuleSet,
+  migrationProgress,
+  processNextBatch,
+  retryFailedBatches,
+  startMigration,
+} from './standards';
+import { createInitialProject, normalizeProject } from './sample';
+import type { BatchStatus, HistoryState, ProofIssue, ProjectState, StandardsPackage, TextbookLine, VersionSnapshot } from './types';
 
 const STORAGE_KEY = 'sologsb-1010-braille-project-v1';
 const HISTORY_LIMIT = 60;
@@ -54,7 +63,7 @@ function loadInitialState(): ProjectState {
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
     if (raw) {
-      const parsed = JSON.parse(raw) as ProjectState;
+      const parsed = normalizeProject(JSON.parse(raw) as ProjectState);
       return analyzeProject(parsed);
     }
   } catch {
@@ -438,9 +447,9 @@ function RuleDetailPanel({ state, onUpdateRule, onDeleteRule }: { state: Project
         <div class="metric-row"><span>{active.rules.filter((rule) => rule.enabled).length} 条启用</span><span>{active.rules.filter((rule) => rule.suspicious).length} 条可疑</span></div>
       </div>
       {active.rules.map((rule) => (
-        <div class="rule-detail-card" key={rule.id}>
+        <div class={`rule-detail-card ${rule.archived ? 'archived' : ''}`} key={rule.id}>
           <div>
-            <strong>{rule.source || '数字符'}</strong>
+            <strong>{rule.source || '数字符'}{rule.archived && <span class="archived-badge">已停用留档</span>}</strong>
             <span>{rule.output} · {rule.kind}</span>
             {rule.description && <p>{rule.description}</p>}
           </div>
@@ -479,9 +488,168 @@ function VersionsPanel({ state, onSnapshot, onRestore }: { state: ProjectState; 
   );
 }
 
+function diffStatusLabel(status: string): string {
+  if (status === 'added') return '新增';
+  if (status === 'changed') return '改过';
+  if (status === 'deprecated') return '停用';
+  return '未变';
+}
+
+function MigrationPanel({
+  state,
+  onStart,
+  onStartFromFile,
+  onNextBatch,
+  onRetry,
+  onConfirm,
+  onRollback,
+}: {
+  state: ProjectState;
+  onStart: (pkg: StandardsPackage) => void;
+  onStartFromFile: (file: File) => void;
+  onNextBatch: () => void;
+  onRetry: () => void;
+  onConfirm: () => void;
+  onRollback: () => void;
+}) {
+  const activeSet = state.ruleSets.find((ruleSet) => ruleSet.id === state.activeRuleSetId) ?? state.ruleSets[0];
+  const migration = state.migration;
+  const progress = migrationProgress(migration);
+  const fileRef = useRef<HTMLInputElement>(null);
+  const [showDiff, setShowDiff] = useState(false);
+
+  const previewDiff = useMemo(() => diffRulesAgainstRuleSet(NEW_STANDARD_PACKAGE, activeSet), [activeSet]);
+  const previewCounts = useMemo(() => ({
+    added: previewDiff.filter((entry) => entry.status === 'added').length,
+    changed: previewDiff.filter((entry) => entry.status === 'changed').length,
+    deprecated: previewDiff.filter((entry) => entry.status === 'deprecated').length,
+  }), [previewDiff]);
+
+  const diffEntries = migration?.diff ?? previewDiff;
+  const diffCounts = useMemo(() => ({
+    added: diffEntries.filter((entry) => entry.status === 'added').length,
+    changed: diffEntries.filter((entry) => entry.status === 'changed').length,
+    deprecated: diffEntries.filter((entry) => entry.status === 'deprecated').length,
+  }), [diffEntries]);
+
+  const batchLabel = (status: BatchStatus): string => {
+    if (status === 'done') return '已迁完';
+    if (status === 'failed') return '失败';
+    return '待迁移';
+  };
+
+  const started = Boolean(migration);
+  const allDone = started && progress.total > 0 && progress.done === progress.total;
+  const confirmed = migration?.confirmed;
+
+  return (
+    <div class="inspector-body">
+      <div class="snapshot-callout">
+        <div>
+          <strong>{NEW_STANDARD_PACKAGE.name}</strong>
+          <p>{NEW_STANDARD_PACKAGE.version} · 下发于 {NEW_STANDARD_PACKAGE.issuedAt}</p>
+          {NEW_STANDARD_PACKAGE.summary && <p class="migration-summary">{NEW_STANDARD_PACKAGE.summary}</p>}
+        </div>
+        {!started && (
+          <div class="stack-sm">
+            <md-filled-button onClick={() => onStart(NEW_STANDARD_PACKAGE)}>使用这份规范包</md-filled-button>
+            <md-outlined-button onClick={() => fileRef.current?.click()}>导入规范包 JSON</md-outlined-button>
+            <input
+              ref={fileRef}
+              type="file"
+              accept="application/json,.json"
+              style={{ display: 'none' }}
+              onChange={(event) => {
+                const file = (event.currentTarget as HTMLInputElement).files?.[0];
+                if (file) onStartFromFile(file);
+                (event.currentTarget as HTMLInputElement).value = '';
+              }}
+            />
+          </div>
+        )}
+      </div>
+
+      {!started && (
+        <div class="rule-summary">
+          <strong>逐条比对草稿规则</strong>
+          <p>规范包与当前规则集逐条比对，列出新增、改过与停用。</p>
+          <div class="metric-row">
+            <span class="diff-chip added">新增 {previewCounts.added}</span>
+            <span class="diff-chip changed">改过 {previewCounts.changed}</span>
+            <span class="diff-chip deprecated">停用 {previewCounts.deprecated}</span>
+          </div>
+          <md-text-button onClick={() => setShowDiff((value) => !value)}>{showDiff ? '收起明细' : '查看明细'}</md-text-button>
+          {showDiff && (
+            <div class="diff-list">
+              {previewDiff.filter((entry) => entry.status !== 'unchanged').map((entry) => (
+                <div class={`diff-row ${entry.status}`} key={`${entry.kind}-${entry.source}`}>
+                  <span class="diff-status">{diffStatusLabel(entry.status)}</span>
+                  <strong>{entry.source || '数字符'}</strong>
+                  <span class="diff-output">
+                    {entry.oldOutput && <s>{entry.oldOutput}</s>}
+                    {entry.oldOutput && entry.newOutput && ' → '}
+                    {entry.newOutput}
+                  </span>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
+      {started && (
+        <>
+          <div class="rule-summary">
+            <strong>迁移进度</strong>
+            <p>{migration!.packageName} {migration!.packageVersion} · 按课次分批，失败可重试。</p>
+            <div class="metric-row">
+              <span>已迁 {progress.done}/{progress.total} 课次</span>
+              {progress.failed > 0 && <span class="diff-chip deprecated">失败 {progress.failed}</span>}
+              {confirmed && <span class="diff-chip added">已确认切换</span>}
+            </div>
+            <div class="metric-row">
+              <span class="diff-chip added">新增 {diffCounts.added}</span>
+              <span class="diff-chip changed">改过 {diffCounts.changed}</span>
+              <span class="diff-chip deprecated">停用 {diffCounts.deprecated}</span>
+            </div>
+          </div>
+
+          <div class="timeline">
+            {migration!.batches.map((batch) => (
+              <div class={`timeline-item batch-${batch.status}`} key={batch.id}>
+                <span class="timeline-dot" />
+                <div>
+                  <strong>{batch.lessonName}</strong>
+                  <p>{batch.lineIds.length} 行 · {batchLabel(batch.status)}</p>
+                  {batch.error && <p class="batch-error">{batch.error}</p>}
+                  {batch.appliedAt && <p>已于 {formatTime(batch.appliedAt)} 重转</p>}
+                </div>
+              </div>
+            ))}
+          </div>
+
+          <div class="stack-sm">
+            {!confirmed && (
+              <>
+                <md-filled-tonal-button onClick={onNextBatch} disabled={!migration!.batches.some((batch) => batch.status === 'pending')}>
+                  迁移下一课次
+                </md-filled-tonal-button>
+                <md-outlined-button onClick={onRetry} disabled={progress.failed === 0}>重试失败课次</md-outlined-button>
+                <md-filled-button onClick={onConfirm} disabled={!allDone}>确认切换新规范</md-filled-button>
+                <md-text-button onClick={onRollback}>恢复旧规范（撤销迁移）</md-text-button>
+              </>
+            )}
+            {confirmed && <p class="migration-summary">已按新规范完成全部课次重转。如需回退，可在版本记录中恢复迁移前快照。</p>}
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
 export default function App() {
   const { state, history, commit, undo, redo, restore } = useProject();
-  const [inspectorTab, setInspectorTab] = useState<'issues' | 'rules' | 'versions'>('issues');
+  const [inspectorTab, setInspectorTab] = useState<'issues' | 'rules' | 'versions' | 'migration'>('issues');
   const selectedLineRef = useRef(state.selectedLineId);
   selectedLineRef.current = state.selectedLineId;
 
@@ -605,9 +773,11 @@ export default function App() {
       .split(/\n+|(?<=[.!?。！？])\s+/)
       .map((line) => line.trim())
       .filter(Boolean);
+    const lessonId = `lesson-import-${Date.now().toString(36)}`;
     commit('导入课文', (current) => analyzeProject({
       ...current,
-      lines: sourceLines.map((source, index) => ({ id: `line-import-${Date.now()}-${index}`, source, tokens: [], status: index === 0 ? 'questionable' : 'unchecked', note: index === 0 ? '导入后待确认规则集。' : '', continuesPrevious: false, continuesNext: false })),
+      lessons: [{ id: lessonId, name: '导入课文' }],
+      lines: sourceLines.map((source, index) => ({ id: `line-import-${Date.now()}-${index}`, lessonId, source, tokens: [], status: index === 0 ? 'questionable' : 'unchecked', note: index === 0 ? '导入后待确认规则集。' : '', continuesPrevious: false, continuesNext: false })),
       selectedLineId: '',
       issues: [],
     }));
@@ -670,11 +840,18 @@ export default function App() {
           onStatus={changeStatus}
           onDelete={(lineId) => commit('删除课文行', (current) => {
             const lines = current.lines.filter((line) => line.id !== lineId);
-            return analyzeProject({ ...current, lines: lines.length ? lines : [{ id: `line-${Date.now()}`, source: '', tokens: [], status: 'unchecked', note: '', continuesPrevious: false, continuesNext: false }], selectedLineId: lines[0]?.id ?? '' });
+            const fallbackLesson = current.lessons[0]?.id ?? `lesson-${Date.now()}`;
+            const fallback: TextbookLine = { id: `line-${Date.now()}`, lessonId: fallbackLesson, source: '', tokens: [], status: 'unchecked', note: '', continuesPrevious: false, continuesNext: false };
+            const nextLines = lines.length ? lines : [fallback];
+            const usedLessonIds = new Set(nextLines.map((line) => line.lessonId));
+            const lessons = current.lessons.filter((lesson) => usedLessonIds.has(lesson.id));
+            return analyzeProject({ ...current, lessons: lessons.length ? lessons : [{ id: fallbackLesson, name: '导入课文' }], lines: nextLines, selectedLineId: nextLines[0]?.id ?? '' });
           })}
           onAddLine={() => commit('新增课文行', (current) => {
-            const line: TextbookLine = { id: `line-${Date.now()}`, source: '', tokens: [], status: 'unchecked', note: '', continuesPrevious: false, continuesNext: false };
-            return analyzeProject({ ...current, lines: [...current.lines, line], selectedLineId: line.id });
+            const lessonId = current.lessons[current.lessons.length - 1]?.id ?? `lesson-${Date.now()}`;
+            const lessons = current.lessons.some((lesson) => lesson.id === lessonId) ? current.lessons : [...current.lessons, { id: lessonId, name: '新课次' }];
+            const line: TextbookLine = { id: `line-${Date.now()}`, lessonId, source: '', tokens: [], status: 'unchecked', note: '', continuesPrevious: false, continuesNext: false };
+            return analyzeProject({ ...current, lessons, lines: [...current.lines, line], selectedLineId: line.id });
           })}
           onSplitLongLines={() => commit('按句拆分长行', (current) => {
             const lines = current.lines.flatMap((line) => line.source
@@ -691,6 +868,7 @@ export default function App() {
             <button class={inspectorTab === 'issues' ? 'active' : ''} onClick={() => setInspectorTab('issues')}>问题 {unresolvedCount > 0 && <span>{unresolvedCount}</span>}</button>
             <button class={inspectorTab === 'rules' ? 'active' : ''} onClick={() => setInspectorTab('rules')}>规则详情</button>
             <button class={inspectorTab === 'versions' ? 'active' : ''} onClick={() => setInspectorTab('versions')}>版本 {state.versions.length > 0 && <span>{state.versions.length}</span>}</button>
+            <button class={inspectorTab === 'migration' ? 'active' : ''} onClick={() => setInspectorTab('migration')}>规范迁移 {state.migration && !state.migration.confirmed && <span>{migrationProgress(state.migration).done}/{migrationProgress(state.migration).total}</span>}</button>
           </div>
           {inspectorTab === 'issues' && (
             <IssuesPanel
@@ -711,6 +889,40 @@ export default function App() {
             const restored: ProjectState = cloneState({ ...version.snapshot, versions: state.versions });
             restore(restored);
           }} />}
+          {inspectorTab === 'migration' && (
+            <MigrationPanel
+              state={state}
+              onStart={(pkg) => commit('启动规范迁移', (current) => startMigration(current, pkg))}
+              onStartFromFile={(file) => {
+                const reader = new FileReader();
+                reader.onload = () => {
+                  try {
+                    const pkg = JSON.parse(String(reader.result)) as StandardsPackage;
+                    if (!pkg.id || !Array.isArray(pkg.rules)) throw new Error('规范包缺少 id 或 rules');
+                    commit('启动规范迁移（导入包）', (current) => startMigration(current, pkg));
+                  } catch (err) {
+                    commit('规范包导入失败', (current) => ({
+                      ...current,
+                      updatedAt: new Date().toISOString(),
+                    }));
+                    window.alert(`规范包解析失败：${err instanceof Error ? err.message : String(err)}`);
+                  }
+                };
+                reader.readAsText(file);
+              }}
+              onNextBatch={() => commit('迁移下一课次', processNextBatch)}
+              onRetry={() => commit('重试失败课次', retryFailedBatches)}
+              onConfirm={() => commit('确认切换新规范', confirmMigration)}
+              onRollback={() => {
+                const migration = state.migration;
+                if (!migration) return;
+                const version = state.versions.find((item) => item.id === migration.preSnapshotId);
+                if (!version) return;
+                const restored: ProjectState = cloneState({ ...version.snapshot, versions: state.versions });
+                restore(restored);
+              }}
+            />
+          )}
         </aside>
       </div>
     </div>

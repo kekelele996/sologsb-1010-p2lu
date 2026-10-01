@@ -224,6 +224,44 @@ export function analyzeProject(state: ProjectState): ProjectState {
   };
 }
 
+/**
+ * 只重新转写指定行（迁移按课次分批时使用）。
+ * 其余行的 token 与问题保留；被重转行的问题重新生成。
+ */
+export function retranscribeLines(state: ProjectState, lineIds: Set<string>): ProjectState {
+  const ruleSet = state.ruleSets.find((item) => item.id === state.activeRuleSetId) ?? state.ruleSets[0];
+
+  const nextLines = state.lines.map((line, index) => {
+    if (!lineIds.has(line.id)) return line;
+    const previous = state.lines[index - 1];
+    const continuesPrevious = Boolean(previous?.source.trimEnd().endsWith('-'));
+    const tokens = transcribeLine(line.source, ruleSet, continuesPrevious);
+    return {
+      ...line,
+      tokens,
+      status: 'questionable' as const,
+      continuesPrevious,
+      continuesNext: line.source.trimEnd().endsWith('-'),
+    };
+  });
+
+  const keptIssues = state.issues.filter((issue) => !lineIds.has(issue.lineId));
+  const nextIssues: ProofIssue[] = [];
+  nextLines.forEach((line, index) => {
+    if (!lineIds.has(line.id)) return;
+    const analyzed = analyzeLine(line, nextLines[index - 1]);
+    nextIssues.push(...analyzed.issues);
+  });
+
+  return {
+    ...state,
+    lines: nextLines,
+    issues: [...keptIssues, ...nextIssues],
+    lastCheckedAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  };
+}
+
 export function updateRuleInSet(ruleSet: RuleSet, ruleId: string, patch: Partial<TranscriptionRule>): RuleSet {
   return {
     ...ruleSet,
