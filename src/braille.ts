@@ -25,7 +25,7 @@ const DIGITS: Record<string, string> = {
 const uid = (prefix: string) => `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 
 function activeRule(ruleSet: RuleSet, source: string, kind: TranscriptionRule['kind']): TranscriptionRule | undefined {
-  return ruleSet.rules.find((rule) => rule.enabled && rule.kind === kind && rule.source.toLocaleLowerCase() === source.toLocaleLowerCase());
+  return ruleSet.rules.find((rule) => rule.enabled && !rule.retired && rule.kind === kind && rule.source.toLocaleLowerCase() === source.toLocaleLowerCase());
 }
 
 function matchContraction(ruleSet: RuleSet, source: string, index: number): TranscriptionRule | undefined {
@@ -34,7 +34,7 @@ function matchContraction(ruleSet: RuleSet, source: string, index: number): Tran
   if (/[\p{L}\p{N}]/u.test(before)) return undefined;
 
   const candidates = ruleSet.rules
-    .filter((rule) => rule.enabled && rule.kind === 'contraction')
+    .filter((rule) => rule.enabled && !rule.retired && rule.kind === 'contraction')
     .sort((a, b) => b.source.length - a.source.length);
 
   const rest = source.slice(index).toLocaleLowerCase();
@@ -202,12 +202,38 @@ function analyzeLine(line: TextbookLine, previousLine?: TextbookLine): { line: T
   return { line: nextLine, issues };
 }
 
-export function analyzeProject(state: ProjectState): ProjectState {
-  const ruleSet = state.ruleSets.find((item) => item.id === state.activeRuleSetId) ?? state.ruleSets[0];
+/**
+ * 迁移中的项目按行选择规则集：已迁课次的行用新规范重转，其余行仍用旧规范。
+ * 返回每行实际使用的规则集；非迁移项目所有行统一用激活规则集。
+ */
+function ruleSetForLine(state: ProjectState, lineId: string): RuleSet {
+  const active = state.ruleSets.find((item) => item.id === state.activeRuleSetId) ?? state.ruleSets[0];
+  const migration = state.migration;
+  if (!migration || migration.status !== 'in-progress') return active;
+
+  const base = state.ruleSets.find((item) => item.id === migration.baseRuleSetId) ?? active;
+  const target = state.ruleSets.find((item) => item.id === migration.targetRuleSetId) ?? active;
+  const migrated = migration.lessons.some(
+    (lesson) => lesson.status === 'migrated' && lesson.lineIds.includes(lineId),
+  );
+  return migrated ? target : base;
+}
+
+export interface TranscribeOptions {
+  /** 迁移探针：强制全部行使用指定规则集，用于探测某课次在新规范下是否有阻断问题。 */
+  forceRuleSetId?: string;
+}
+
+export function transcribeProject(state: ProjectState, options: TranscribeOptions = {}): ProjectState {
+  const forced = options.forceRuleSetId
+    ? state.ruleSets.find((item) => item.id === options.forceRuleSetId)
+    : undefined;
+  const ruleSets = state.ruleSets;
   const nextLines: TextbookLine[] = [];
   const issues: ProofIssue[] = [];
 
   state.lines.forEach((line, index) => {
+    const ruleSet = forced ?? ruleSetForLine(state, line.id) ?? ruleSets[0];
     const previousSourceContinues = Boolean(state.lines[index - 1]?.source.trimEnd().endsWith('-'));
     const tokens = transcribeLine(line.source, ruleSet, previousSourceContinues);
     const analyzed = analyzeLine({ ...line, tokens }, state.lines[index - 1]);
@@ -222,6 +248,23 @@ export function analyzeProject(state: ProjectState): ProjectState {
     lastCheckedAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
   };
+}
+
+/**
+ * 按当前激活规则集（迁移中则按行选择新旧规范）重新转录并检查全部课文行。
+ */
+export function analyzeProject(state: ProjectState): ProjectState {
+  return transcribeProject(state);
+}
+
+/**
+ * 用指定规则集试转录给定行，返回其中阻断级（error）问题，供课次迁移前校验。
+ */
+export function blockingIssuesForLines(state: ProjectState, ruleSetId: string, lineIds: string[]): ProofIssue[] {
+  const probe: ProjectState = { ...state, migration: undefined, activeRuleSetId: ruleSetId };
+  const retranscribed = transcribeProject(probe, { forceRuleSetId: ruleSetId });
+  const idSet = new Set(lineIds);
+  return retranscribed.issues.filter((item) => item.severity === 'error' && idSet.has(item.lineId));
 }
 
 export function updateRuleInSet(ruleSet: RuleSet, ruleId: string, patch: Partial<TranscriptionRule>): RuleSet {

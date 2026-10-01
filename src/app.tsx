@@ -1,8 +1,20 @@
 import { useEffect, useMemo, useReducer, useRef, useState } from 'preact/hooks';
 import type { ComponentChildren } from 'preact';
 import { analyzeProject, brailleCellCount, makeRule, outputText, updateRuleInSet } from './braille';
+import {
+  applyPackage,
+  createSnapshot,
+  dismissMigration,
+  migrateLesson,
+  migrateRemainingLessons,
+  migrationProgress,
+  parsePackage,
+  PackageValidationError,
+  rollbackMigration,
+} from './migration';
+import MigrationPanel from './MigrationPanel';
 import { createInitialProject } from './sample';
-import type { HistoryState, ProofIssue, ProjectState, TextbookLine, VersionSnapshot } from './types';
+import type { HistoryState, ProofIssue, ProjectState, StandardPackage, TextbookLine, VersionSnapshot } from './types';
 
 const STORAGE_KEY = 'sologsb-1010-braille-project-v1';
 const HISTORY_LIMIT = 60;
@@ -115,6 +127,7 @@ function RuleSetPanel({
   onToggleContractions,
   onAddRule,
   onRecheck,
+  selectionLocked,
 }: {
   state: ProjectState;
   onSelect: (id: string) => void;
@@ -122,27 +135,36 @@ function RuleSetPanel({
   onToggleContractions: () => void;
   onAddRule: (source: string, output: string, suspicious: boolean) => void;
   onRecheck: () => void;
+  selectionLocked: boolean;
 }) {
   const active = state.ruleSets.find((ruleSet) => ruleSet.id === state.activeRuleSetId) ?? state.ruleSets[0];
   const [showAllRules, setShowAllRules] = useState(false);
   const [newSource, setNewSource] = useState('');
   const [newOutput, setNewOutput] = useState('');
   const [suspicious, setSuspicious] = useState(true);
-  const visibleRules = showAllRules ? active.rules : active.rules.filter((rule) => rule.kind === 'contraction' || rule.suspicious);
+  const visibleRules = showAllRules ? active.rules : active.rules.filter((rule) => rule.kind === 'contraction' || rule.suspicious || rule.retired);
 
   return (
     <aside class="left-panel scroll-pane" aria-label="规则集与规则编辑">
-      <Section title="规则集" subtitle="切换后会自动重转录全部行">
+      <Section title="规则集" subtitle={selectionLocked ? '规范迁移进行中：确认或切回旧规范前暂不能切换激活规则集，已迁课次按新规范重转。' : '切换后会自动重转录全部行'}>
         <div class="stack-sm">
-          {state.ruleSets.map((ruleSet) => (
-            <button class={`rule-set-card ${ruleSet.id === active.id ? 'active' : ''}`} key={ruleSet.id} onClick={() => onSelect(ruleSet.id)}>
-              <span>
-                <strong>{ruleSet.name}</strong>
-                <small>{ruleSet.rules.filter((rule) => rule.enabled).length} 条启用规则</small>
-              </span>
-              <span class="radio-dot" aria-hidden="true" />
-            </button>
-          ))}
+          {state.ruleSets.map((ruleSet) => {
+            const isTarget = state.migration?.targetRuleSetId === ruleSet.id && selectionLocked;
+            return (
+              <button
+                class={`rule-set-card ${ruleSet.id === active.id ? 'active' : ''} ${isTarget ? 'migration-target' : ''}`}
+                key={ruleSet.id}
+                disabled={selectionLocked && ruleSet.id !== active.id}
+                onClick={() => onSelect(ruleSet.id)}
+              >
+                <span>
+                  <strong>{ruleSet.name}{isTarget && <em class="target-tag">迁移目标</em>}</strong>
+                  <small>{ruleSet.rules.filter((rule) => rule.enabled).length} 条启用规则 · {ruleSet.rules.filter((rule) => rule.retired).length} 条停用留档</small>
+                </span>
+                <span class="radio-dot" aria-hidden="true" />
+              </button>
+            );
+          })}
         </div>
       </Section>
 
@@ -159,30 +181,33 @@ function RuleSetPanel({
         </div>
       </Section>
 
-      <Section title="缩写与标点" subtitle="可疑规则会在校对区生成提醒">
+      <Section title="缩写与标点" subtitle={active.rules.some((rule) => rule.retired) ? '带「停用留档」标记的规则保留可查，但不再参与转写' : '可疑规则会在校对区生成提醒'}>
         <div class="rule-list">
           {visibleRules.map((rule) => (
-            <div class={`rule-row ${rule.suspicious ? 'suspicious' : ''}`} key={rule.id}>
-              <md-checkbox checked={rule.enabled} onInput={() => onUpdateRule(rule.id, { enabled: !rule.enabled })} aria-label={`启用 ${rule.source}`} />
+            <div class={`rule-row ${rule.suspicious ? 'suspicious' : ''} ${rule.retired ? 'retired' : ''}`} key={rule.id}>
+              <md-checkbox checked={rule.enabled && !rule.retired} disabled={rule.retired} onInput={() => onUpdateRule(rule.id, { enabled: !rule.enabled })} aria-label={`启用 ${rule.source}`} />
               <md-outlined-text-field
                 class="rule-source"
                 value={rule.source}
-                label="原文"
+                label={rule.retired ? '已停用留档' : '原文'}
+                disabled={rule.retired}
                 onInput={(event: any) => onUpdateRule(rule.id, { source: event.currentTarget.value })}
               />
               <md-outlined-text-field
                 class="rule-output"
                 value={rule.output}
                 label="盲文"
+                disabled={rule.retired}
                 onInput={(event: any) => onUpdateRule(rule.id, { output: event.currentTarget.value })}
               />
               <md-icon-button
                 class={rule.suspicious ? 'warning-button active' : 'warning-button'}
                 aria-label={rule.suspicious ? '取消可疑标记' : '标记为可疑'}
                 title={rule.suspicious ? '取消可疑标记' : '标记为可疑'}
+                disabled={rule.retired}
                 onClick={() => onUpdateRule(rule.id, { suspicious: !rule.suspicious })}
               >
-                {rule.suspicious ? '!' : '○'}
+                {rule.retired ? '停' : rule.suspicious ? '!' : '○'}
               </md-icon-button>
             </div>
           ))}
@@ -438,15 +463,15 @@ function RuleDetailPanel({ state, onUpdateRule, onDeleteRule }: { state: Project
         <div class="metric-row"><span>{active.rules.filter((rule) => rule.enabled).length} 条启用</span><span>{active.rules.filter((rule) => rule.suspicious).length} 条可疑</span></div>
       </div>
       {active.rules.map((rule) => (
-        <div class="rule-detail-card" key={rule.id}>
+        <div class={`rule-detail-card ${rule.retired ? 'retired' : ''}`} key={rule.id}>
           <div>
-            <strong>{rule.source || '数字符'}</strong>
-            <span>{rule.output} · {rule.kind}</span>
+            <strong>{rule.source || '数字符'}{rule.retired && <em class="retired-tag">停用留档</em>}</strong>
+            <span>{rule.output} · {rule.kind}{rule.fromPackageId ? ' · 新规范' : ''}</span>
             {rule.description && <p>{rule.description}</p>}
           </div>
           <div class="rule-detail-actions">
-            <md-checkbox checked={rule.suspicious} onInput={() => onUpdateRule(rule.id, { suspicious: !rule.suspicious })} label="可疑" />
-            <md-icon-button aria-label="删除规则" title="删除规则" onClick={() => onDeleteRule(rule.id)}>×</md-icon-button>
+            <md-checkbox checked={rule.suspicious} disabled={rule.retired} onInput={() => onUpdateRule(rule.id, { suspicious: !rule.suspicious })} label="可疑" />
+            <md-icon-button aria-label={rule.retired ? '停用规则不可删除' : '删除规则'} title={rule.retired ? '停用留档规则不可删除' : '删除规则'} disabled={rule.retired} onClick={() => onDeleteRule(rule.id)}>×</md-icon-button>
           </div>
         </div>
       ))}
@@ -479,9 +504,46 @@ function VersionsPanel({ state, onSnapshot, onRestore }: { state: ProjectState; 
   );
 }
 
+function MigrationRibbon({
+  state,
+  onOpen,
+  onMigrateRemaining,
+  onRollback,
+  onDismiss,
+}: {
+  state: ProjectState;
+  onOpen: () => void;
+  onMigrateRemaining: () => void;
+  onRollback: () => void;
+  onDismiss: () => void;
+}) {
+  const session = state.migration!;
+  const progress = migrationProgress(session);
+  const done = session.status === 'confirmed';
+  return (
+    <div class={`migration-ribbon ${done ? 'done' : progress.failed > 0 ? 'has-failure' : ''}`}>
+      <span class={`migration-ribbon-dot ${done ? 'done' : ''}`} />
+      <div class="migration-ribbon-text">
+        <strong>{done ? '规范迁移完成：全部课文已按新规范重转' : '规范迁移进行中'}</strong>
+        <span>
+          {done
+            ? '新规范已激活；旧规则集与迁移前整册快照均已保留。'
+            : `已迁 ${progress.migrated}/${progress.total} 课${progress.failed ? ` · ${progress.failed} 课失败待重试` : ''} · 已迁课次按新规范，未迁课次仍用旧规范`}
+        </span>
+      </div>
+      <div class="migration-ribbon-actions">
+        <md-text-button onClick={onOpen}>打开迁移面板</md-text-button>
+        {!done && <md-filled-tonal-button onClick={onMigrateRemaining}>迁移/重试全部课次</md-filled-tonal-button>}
+        {!done && <md-text-button onClick={onRollback}>切回旧规范</md-text-button>}
+        {done && <md-text-button onClick={onDismiss}>归档</md-text-button>}
+      </div>
+    </div>
+  );
+}
+
 export default function App() {
   const { state, history, commit, undo, redo, restore } = useProject();
-  const [inspectorTab, setInspectorTab] = useState<'issues' | 'rules' | 'versions'>('issues');
+  const [inspectorTab, setInspectorTab] = useState<'issues' | 'rules' | 'migration' | 'versions'>('issues');
   const selectedLineRef = useRef(state.selectedLineId);
   selectedLineRef.current = state.selectedLineId;
 
@@ -548,19 +610,8 @@ export default function App() {
     return () => window.removeEventListener('keydown', onKeyDown);
   });
 
-  const createSnapshot = (action: string, source = state): VersionSnapshot => {
-    const { versions: _versions, ...snapshot } = cloneState(source);
-    return {
-      id: `version-${Date.now().toString(36)}`,
-      name: `${action} · ${source.lines.filter((line) => line.status === 'approved').length}/${source.lines.length} 行完成`,
-      createdAt: new Date().toISOString(),
-      action,
-      snapshot,
-    };
-  };
-
   const recordVersion = (action = '手动记录') => {
-    commit('记录版本快照', (current) => ({ ...current, versions: [createSnapshot(action, current), ...current.versions].slice(0, 20), updatedAt: new Date().toISOString() }));
+    commit('记录版本快照', (current) => ({ ...current, versions: [createSnapshot(current, action), ...current.versions].slice(0, 20), updatedAt: new Date().toISOString() }));
   };
 
   const exportText = () => {
@@ -613,6 +664,46 @@ export default function App() {
     }));
   };
 
+  const applyStandardPackage = (pkg: StandardPackage): { ok: boolean; message: string } => {
+    let message = '';
+    let failure = '';
+    commit('提交规范包', (current) => {
+      try {
+        const valid = parsePackage(JSON.stringify(pkg));
+        const result = applyPackage(current, valid);
+        const labelMap = {
+          started: `已开始迁移：${valid.standardName}，规则比对完成，请按课次分批迁移。`,
+          continued: `续包 ${valid.standardVersion} 已接收，新规则与课次已并入本次迁移。`,
+          idempotent: '同一份规范包此前已提交，未重复改写规则；仅核对课次进度。',
+        } as const;
+        message = labelMap[result.outcome];
+        return result.state;
+      } catch (err) {
+        failure = err instanceof PackageValidationError ? err.message : '规范包应用失败，请检查包内容。';
+        return current;
+      }
+    });
+    return { ok: !failure, message: failure || message };
+  };
+
+  const migrateOneLesson = (lessonId: string) => {
+    commit('迁移课次', (current) => migrateLesson(current, lessonId));
+  };
+
+  const migrateAllLessons = () => {
+    commit('按课次顺序迁移全部', migrateRemainingLessons);
+  };
+
+  const rollbackToOldStandard = () => {
+    commit('切回旧规范（回滚）', (current) => rollbackMigration(current));
+  };
+
+  const finishMigration = () => {
+    commit('归档规范迁移', (current) => dismissMigration(current));
+  };
+
+  const migrationInProgress = state.migration?.status === 'in-progress';
+
   return (
     <div class="app-shell">
       <header class="topbar">
@@ -644,10 +735,24 @@ export default function App() {
         <div class="shortcut-hint">快捷键：⌘/Ctrl Z 撤销 · ⇧⌘/Ctrl Z 重做 · ⌘/Ctrl Enter 批准并下一行 · J/K 切换行</div>
       </div>
 
+      {state.migration && (
+        <MigrationRibbon
+          state={state}
+          onOpen={() => setInspectorTab('migration')}
+          onMigrateRemaining={migrateAllLessons}
+          onRollback={rollbackToOldStandard}
+          onDismiss={finishMigration}
+        />
+      )}
+
       <div class="workspace-grid">
         <RuleSetPanel
           state={state}
-          onSelect={(id) => commit('切换规则集并重新检查', (current) => analyzeProject({ ...current, activeRuleSetId: id, issues: [] }))}
+          onSelect={(id) => {
+            if (migrationInProgress && id !== state.activeRuleSetId) return;
+            commit('切换规则集并重新检查', (current) => analyzeProject({ ...current, activeRuleSetId: id, issues: [] }));
+          }}
+          selectionLocked={migrationInProgress}
           onUpdateRule={updateRule}
           onToggleContractions={() => {
             const ruleSet = activeRuleSet;
@@ -687,9 +792,12 @@ export default function App() {
         />
 
         <aside class="right-panel">
-          <div class="inspector-tabs" role="tablist">
+          <div class="inspector-tabs four" role="tablist">
             <button class={inspectorTab === 'issues' ? 'active' : ''} onClick={() => setInspectorTab('issues')}>问题 {unresolvedCount > 0 && <span>{unresolvedCount}</span>}</button>
-            <button class={inspectorTab === 'rules' ? 'active' : ''} onClick={() => setInspectorTab('rules')}>规则详情</button>
+            <button class={inspectorTab === 'rules' ? 'active' : ''} onClick={() => setInspectorTab('rules')}>规则</button>
+            <button class={inspectorTab === 'migration' ? 'active' : ''} onClick={() => setInspectorTab('migration')}>
+              规范迁移 {state.migration && state.migration.status === 'in-progress' && <span class="migration-badge">{migrationProgress(state.migration).migrated}/{migrationProgress(state.migration).total}</span>}
+            </button>
             <button class={inspectorTab === 'versions' ? 'active' : ''} onClick={() => setInspectorTab('versions')}>版本 {state.versions.length > 0 && <span>{state.versions.length}</span>}</button>
           </div>
           {inspectorTab === 'issues' && (
@@ -707,6 +815,17 @@ export default function App() {
               ruleSets: current.ruleSets.map((set) => set.id === current.activeRuleSetId ? { ...set, rules: set.rules.filter((rule) => rule.id !== ruleId) } : set),
             }));
           }} />}
+          {inspectorTab === 'migration' && (
+            <MigrationPanel
+              state={state}
+              onApplyPackage={applyStandardPackage}
+              onMigrateLesson={migrateOneLesson}
+              onMigrateRemaining={migrateAllLessons}
+              onRollback={rollbackToOldStandard}
+              onDismiss={finishMigration}
+              onJump={(lineId) => selectLine(lineId, true)}
+            />
+          )}
           {inspectorTab === 'versions' && <VersionsPanel state={state} onSnapshot={() => recordVersion()} onRestore={(version) => {
             const restored: ProjectState = cloneState({ ...version.snapshot, versions: state.versions });
             restore(restored);
